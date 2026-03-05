@@ -1,0 +1,17 @@
+{
+  "id": "canvasGrades",
+  "name": "Canvas Grades",
+  "description": "Courses, grades, upcoming assignments, missing work, and announcements from Canvas LMS",
+  "version": "1.0.0",
+  "author": "mcwiseman97",
+  "icon": "school",
+  "type": "widget",
+  "firstParty": false,
+  "component": "./CanvasWidget.qml",
+  "settings": "./CanvasSettings.qml",
+  "permissions": [
+    "settings_read",
+    "settings_write",
+    "process_read"
+  ]
+}
