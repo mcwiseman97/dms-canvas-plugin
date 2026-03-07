@@ -22,9 +22,16 @@ PluginSettings {
         defaultValue: "byupw.instructure.com"
     }
 
+    PluginGlobalVar {
+        id: pillStyleSetting
+        varName: "pillStyle"
+        defaultValue: "tiers"
+    }
+
     // Test connection state: "idle" | "testing" | "success" | "error"
     property string testState: "idle"
     property string testMessage: ""
+    property string selectedPillStyle: "tiers"
 
     function escapeShellString(str) {
         if (!str) return ""

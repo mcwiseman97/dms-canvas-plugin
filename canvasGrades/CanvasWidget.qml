@@ -9,13 +9,29 @@ import qs.Modules.Plugins
 PluginComponent {
     id: root
 
-    popoutWidth: 420
+    popoutWidth: 700
     popoutHeight: 740
 
     // Settings from pluginData
     property string apiToken: (pluginData && pluginData.apiToken) ? pluginData.apiToken : ""
     property string canvasDomain: (pluginData && pluginData.canvasDomain) ? pluginData.canvasDomain : "byupw.instructure.com"
     property int refreshInterval: (pluginData && pluginData.refreshInterval) ? pluginData.refreshInterval : 300
+    property string pillStyle: (pluginData && pluginData.pillStyle) ? pluginData.pillStyle : "tiers"
+
+    property string nextDueLabel: {
+        if (assignments.length === 0) return "0"
+        var d = assignments[0].days_until
+        if (d <= 0) return "Today"
+        if (d === 1) return "Tomorrow"
+        return d + "d"
+    }
+    property color nextDueColor: {
+        if (assignments.length === 0) return Theme.surfaceContainerHigh
+        var d = assignments[0].days_until
+        if (d <= 1) return Theme.error
+        if (d <= 6) return Theme.warning
+        return Theme.primary
+    }
 
     // State
     property var courses: []
@@ -27,6 +43,28 @@ PluginComponent {
     property string errorMessage: ""
     property var lastRefreshTime: null
     property bool isManualRefresh: false
+
+    // Extended feature state
+    property var assignmentGroups: ({})
+    property int unreadInboxCount: 0
+    property int unreadDiscussions: 0
+
+    // Calendar state
+    property int calendarYear: new Date().getFullYear()
+    property int calendarMonth: new Date().getMonth()
+    property var calendarDayMap: {
+        var map = {}
+        var _ = assignments  // ensure reactive binding
+        for (var i = 0; i < assignments.length; i++) {
+            var a = assignments[i]
+            if (a.due_at) {
+                var d = new Date(a.due_at)
+                var key = d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate()
+                map[key] = (map[key] || 0) + 1
+            }
+        }
+        return map
+    }
 
     // Grouped assignment sections
     property var todayItems: {
@@ -78,7 +116,7 @@ PluginComponent {
     }
 
     function typeIcon(type) {
-        if (type === "quiz")       return "quiz"
+        if (type === "quiz")       return "description"
         if (type === "discussion") return "forum"
         if (type === "reading")    return "menu_book"
         if (type === "external")   return "open_in_new"
@@ -87,7 +125,7 @@ PluginComponent {
 
     function typeColor(type) {
         if (type === "quiz")       return Theme.warning
-        if (type === "discussion") return Theme.tertiary
+        if (type === "discussion") return Theme.info
         if (type === "reading")    return Theme.primary
         return Theme.surfaceText
     }
@@ -112,6 +150,9 @@ PluginComponent {
             assignments = []
             missingWork = []
             announcements = []
+            assignmentGroups = ({})
+            unreadInboxCount = 0
+            unreadDiscussions = 0
         }
     }
 
@@ -175,7 +216,7 @@ BASE_URL="https://\${CANVAS_DOMAIN}/api/v1"
 AUTH_HEADER="Authorization: Bearer \${CANVAS_TOKEN}"
 
 TODAY=$(date +%Y-%m-%d)
-END_DATE=$(date -d "+14 days" +%Y-%m-%d)
+END_DATE=$(date -d "+90 days" +%Y-%m-%d)
 START_7=$(date -d "-7 days" +%Y-%m-%d)
 NOW_TS=$(date +%s)
 
@@ -240,7 +281,7 @@ if [ -n "\${course_ids}" ]; then
         ctx_params="\${ctx_params}&context_codes[]=course_\${cid}"
     done
     assignments_raw=$(curl -s -H "\${AUTH_HEADER}" \\
-        "\${BASE_URL}/calendar_events?type=assignment&start_date=\${TODAY}&end_date=\${END_DATE}&per_page=100\${ctx_params}")
+        "\${BASE_URL}/calendar_events?type=assignment&start_date=\${TODAY}&end_date=\${END_DATE}&per_page=100&include[]=submission\${ctx_params}")
     echo "\${assignments_raw}" | jq -c --argjson now "\${NOW_TS}" '
         if type == "array" then
           [.[] |
@@ -259,7 +300,11 @@ if [ -n "\${course_ids}" ]; then
              assignment_id: .assignment.id,
              submission_types: (.assignment.submission_types // []),
              markable: ((.assignment.submission_types // []) | (contains(["none"]) or contains(["not_graded"]))),
-             points_possible: (.assignment.points_possible // null)
+             points_possible: (.assignment.points_possible // null),
+             score: (.assignment.submission.score // null),
+             grade: (.assignment.submission.grade // null),
+             workflow_state: (.assignment.submission.workflow_state // "unsubmitted"),
+             has_feedback: ((.assignment.submission.submission_comments_count // 0) > 0)
            }
           ] | sort_by(.days_until)
         else [] end
@@ -300,6 +345,7 @@ if [ -n "\${course_ids}" ]; then
     echo "\${announcements_raw}" | jq -c --argjson cmap "\${course_map}" --argjson now "\${NOW_TS}" '
         if type == "array" then
           [.[] |
+           select(.read_state != "read") |
            {
              title: (.title // "Unknown"),
              course: (\$cmap[(.context_code | ltrimstr("course_"))] // ""),
@@ -318,12 +364,56 @@ else
     echo '[]' > "\${tmp_announcements}"
 fi
 
+# 5. Fetch additional data in parallel
+# Unread inbox count (single lightweight call)
+tmp_inbox=\$(mktemp)
+curl -s -H "\${AUTH_HEADER}" "\${BASE_URL}/conversations/unread_count" > "\${tmp_inbox}" &
+
+# Assignment groups + discussion unread counts per course
+declare -A gfiles dfiles
+if [ -n "\${course_ids}" ]; then
+    for cid in \${course_ids}; do
+        gf=\$(mktemp)
+        df=\$(mktemp)
+        gfiles[\$cid]=\$gf
+        dfiles[\$cid]=\$df
+        curl -s -H "\${AUTH_HEADER}" "\${BASE_URL}/courses/\${cid}/assignment_groups?include[]=current_grades&per_page=50" > "\$gf" &
+        curl -s -H "\${AUTH_HEADER}" "\${BASE_URL}/courses/\${cid}/discussion_topics?per_page=50" > "\$df" &
+    done
+fi
+wait
+
+unread_inbox=\$(jq '.unread_count // 0' "\${tmp_inbox}" 2>/dev/null || echo 0)
+rm -f "\${tmp_inbox}"
+
+groups_json='{}'
+unread_disc=0
+if [ -n "\${course_ids}" ]; then
+    for cid in \${course_ids}; do
+        gf="\${gfiles[\$cid]}"
+        df="\${dfiles[\$cid]}"
+        if [ -f "\${gf}" ]; then
+            gdata=\$(jq -c '[.[] | select(.group_weight > 0) | {name:.name,weight:.group_weight,score:(.current_score//null),grade:(.current_grade//null)}]' "\${gf}" 2>/dev/null || echo '[]')
+            groups_json=\$(echo "\${groups_json}" | jq -c --arg cid "\${cid}" --argjson g "\${gdata}" '.[\$cid] = \$g')
+            rm -f "\${gf}"
+        fi
+        if [ -f "\${df}" ]; then
+            cnt=\$(jq '[.[] | select(.unread_count > 0)] | length' "\${df}" 2>/dev/null || echo 0)
+            unread_disc=\$((unread_disc + cnt))
+            rm -f "\${df}"
+        fi
+    done
+fi
+
 jq -cn \\
   --slurpfile courses "\${tmp_courses}" \\
   --slurpfile assignments "\${tmp_assignments}" \\
   --slurpfile missing "\${tmp_missing}" \\
   --slurpfile announcements "\${tmp_announcements}" \\
-  '{"error":false,"courses":$courses[0],"assignments":$assignments[0],"missing":$missing[0],"announcements":$announcements[0]}'
+  --argjson groups "\${groups_json}" \\
+  --argjson unread_inbox "\${unread_inbox}" \\
+  --argjson unread_disc "\${unread_disc}" \\
+  '{"error":false,"courses":$courses[0],"assignments":$assignments[0],"missing":$missing[0],"announcements":$announcements[0],"groups":$groups,"unread_inbox":$unread_inbox,"unread_discussions":$unread_disc}'
 `
     }
 
@@ -351,6 +441,9 @@ jq -cn \\
                     root.assignments = result.assignments || []
                     root.missingWork = result.missing || []
                     root.announcements = result.announcements || []
+                    root.assignmentGroups = result.groups || ({})
+                    root.unreadInboxCount = result.unread_inbox || 0
+                    root.unreadDiscussions = result.unread_discussions || 0
 
                     console.log("Canvas: Loaded",
                         root.courses.length, "courses,",
@@ -465,6 +558,11 @@ jq -cn \\
         return Math.floor(hoursAgo / 24) + "d ago"
     }
 
+    function monthName(m) {
+        return ["January","February","March","April","May","June",
+                "July","August","September","October","November","December"][m]
+    }
+
     // Shared assignment row delegate used by all section Repeaters
     Component {
         id: assignRowDelegate
@@ -502,6 +600,20 @@ jq -cn \\
                 z: 1
             }
 
+            // Instructor feedback dot (shown when submission has comments)
+            Rectangle {
+                visible: modelData.has_feedback === true
+                width: 8
+                height: 8
+                radius: 4
+                color: Theme.info
+                anchors.top: aIcon.top
+                anchors.right: aIcon.right
+                anchors.rightMargin: -2
+                anchors.topMargin: -2
+                z: 2
+            }
+
             // Name + course column
             Column {
                 id: aTextCol
@@ -531,19 +643,56 @@ jq -cn \\
                 }
             }
 
-            // Right widget: due label OR mark-done button
+            // Right widget: grade chip OR due label OR mark-done button
             Item {
                 id: aRightWidget
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.spacingS
                 anchors.verticalCenter: parent.verticalCenter
-                width: modelData.markable ? aDoneBtn.width : aDueLbl.implicitWidth
+                width: {
+                    var graded = modelData.workflow_state === "graded" || (modelData.grade != null && String(modelData.grade) !== "")
+                    if (graded) return aGradeChip.width
+                    if (modelData.markable) return aDoneBtn.width
+                    return aDueLbl.implicitWidth
+                }
                 height: Theme.iconSize
                 z: 1
 
+                // Grade chip (shown when assignment is graded)
+                Rectangle {
+                    id: aGradeChip
+                    visible: modelData.workflow_state === "graded" || (modelData.grade != null && String(modelData.grade) !== "")
+                    anchors.centerIn: parent
+                    width: aGradeLbl.implicitWidth + Theme.spacingS * 2
+                    height: Theme.iconSize * 0.9
+                    radius: height / 2
+                    color: {
+                        if (modelData.score != null && modelData.points_possible != null && modelData.points_possible > 0)
+                            return (modelData.score / modelData.points_possible) >= 0.7 ? Qt.rgba(0.15, 0.65, 0.3, 0.25) : Qt.rgba(0.8, 0.2, 0.2, 0.2)
+                        return Theme.surfaceContainerHighest
+                    }
+
+                    StyledText {
+                        id: aGradeLbl
+                        anchors.centerIn: parent
+                        text: {
+                            if (modelData.score != null && modelData.points_possible != null)
+                                return Math.round(modelData.score) + "/" + modelData.points_possible
+                            return String(modelData.grade || "")
+                        }
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        font.weight: Font.Bold
+                        color: {
+                            if (modelData.score != null && modelData.points_possible != null && modelData.points_possible > 0)
+                                return (modelData.score / modelData.points_possible) >= 0.7 ? "#4caf50" : Theme.error
+                            return Theme.primary
+                        }
+                    }
+                }
+
                 StyledText {
                     id: aDueLbl
-                    visible: !modelData.markable
+                    visible: !modelData.markable && !(modelData.workflow_state === "graded" || (modelData.grade != null && String(modelData.grade) !== ""))
                     anchors.centerIn: parent
                     text: root.formatDue(modelData.days_until)
                     font.pixelSize: Theme.fontSizeSmall
@@ -553,7 +702,7 @@ jq -cn \\
 
                 Rectangle {
                     id: aDoneBtn
-                    visible: modelData.markable
+                    visible: modelData.markable && !(modelData.workflow_state === "graded" || (modelData.grade != null && String(modelData.grade) !== ""))
                     anchors.centerIn: parent
                     width: aDoneLbl.implicitWidth + Theme.spacingS * 2
                     height: Theme.iconSize * 0.9
@@ -586,6 +735,7 @@ jq -cn \\
     }
 
     // Horizontal bar pill
+    // Reusable urgency badge: colored pill for a count
     horizontalBarPill: Component {
         Row {
             spacing: Theme.spacingXS
@@ -595,21 +745,20 @@ jq -cn \\
                 size: Theme.iconSize * 0.85
                 color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceVariantText
                 anchors.verticalCenter: parent.verticalCenter
-
                 opacity: root.isLoading ? 0.6 : 1.0
                 Behavior on opacity { NumberAnimation { duration: 200 } }
             }
 
+            // ── Style: total — single badge, urgency color ────────────
             Rectangle {
-                visible: root.apiToken.length > 0
+                visible: root.apiToken.length > 0 && root.pillStyle === "total"
                 height: Theme.iconSize * 0.85
-                width: Math.max(height, pillCountLabel.implicitWidth + 8)
+                width: Math.max(height, hTotalLbl.implicitWidth + 8)
                 radius: height / 2
                 color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceContainerHigh
                 anchors.verticalCenter: parent.verticalCenter
-
                 StyledText {
-                    id: pillCountLabel
+                    id: hTotalLbl
                     anchors.centerIn: parent
                     text: root.assignments.length.toString()
                     font.pixelSize: Theme.fontSizeSmall
@@ -618,25 +767,91 @@ jq -cn \\
                 }
             }
 
+            // ── Style: tiers — red / yellow / blue tier badges ────────
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.assignments.length === 0
+                height: Theme.iconSize * 0.85; width: height; radius: height / 2
+                color: Theme.surfaceContainerHigh
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { anchors.centerIn: parent; text: "0"; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: Theme.surfaceVariantText }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.urgentCount > 0
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hTierUrgLbl.implicitWidth + 8)
+                radius: height / 2; color: Theme.error
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hTierUrgLbl; anchors.centerIn: parent; text: root.urgentCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.soonCount > 0
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hTierSoonLbl.implicitWidth + 8)
+                radius: height / 2; color: Theme.warning
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hTierSoonLbl; anchors.centerIn: parent; text: root.soonCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.laterItems.length > 0
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hTierLateLbl.implicitWidth + 8)
+                radius: height / 2; color: Theme.primary
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hTierLateLbl; anchors.centerIn: parent; text: root.laterItems.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+
+            // ── Style: next — next due label + small total ────────────
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "next" && root.assignments.length > 0
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hNextLbl.implicitWidth + 8)
+                radius: height / 2; color: root.nextDueColor
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hNextLbl; anchors.centerIn: parent; text: root.nextDueLabel; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "next"
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hNextTotalLbl.implicitWidth + 8)
+                radius: height / 2
+                color: root.assignments.length > 0 ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hNextTotalLbl; anchors.centerIn: parent; text: root.assignments.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: root.assignments.length > 0 ? Theme.surfaceText : Theme.surfaceVariantText }
+            }
+
+            // ── Style: urgent — red urgent count + total ──────────────
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "urgent" && root.urgentCount > 0
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hUrgLbl.implicitWidth + 8)
+                radius: height / 2; color: Theme.error
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hUrgLbl; anchors.centerIn: parent; text: root.urgentCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "urgent"
+                height: Theme.iconSize * 0.85
+                width: Math.max(height, hUrgTotalLbl.implicitWidth + 8)
+                radius: height / 2
+                color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceContainerHigh
+                anchors.verticalCenter: parent.verticalCenter
+                StyledText { id: hUrgTotalLbl; anchors.centerIn: parent; text: root.assignments.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: root.assignments.length > 0 ? "white" : Theme.surfaceVariantText }
+            }
+
+            // ── Missing + Inbox (all styles) ──────────────────────────
             Row {
                 visible: root.missingWork.length > 0
                 spacing: 2
                 anchors.verticalCenter: parent.verticalCenter
-
-                DankIcon {
-                    name: "warning"
-                    size: Theme.iconSize * 0.75
-                    color: Theme.error
-                    anchors.verticalCenter: parent.verticalCenter
-                }
-
-                StyledText {
-                    text: root.missingWork.length.toString()
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Bold
-                    color: Theme.error
-                    anchors.verticalCenter: parent.verticalCenter
-                }
+                DankIcon { name: "warning"; size: Theme.iconSize * 0.75; color: Theme.error; anchors.verticalCenter: parent.verticalCenter }
+                StyledText { text: root.missingWork.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: Theme.error; anchors.verticalCenter: parent.verticalCenter }
+            }
+            Row {
+                visible: root.unreadInboxCount > 0
+                spacing: 2
+                anchors.verticalCenter: parent.verticalCenter
+                DankIcon { name: "mail"; size: Theme.iconSize * 0.75; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
+                StyledText { text: root.unreadInboxCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
             }
         }
     }
@@ -651,27 +866,82 @@ jq -cn \\
                 size: Theme.iconSize * 0.85
                 color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceVariantText
                 anchors.horizontalCenter: parent.horizontalCenter
-
                 opacity: root.isLoading ? 0.6 : 1.0
                 Behavior on opacity { NumberAnimation { duration: 200 } }
             }
 
+            // total
             Rectangle {
-                visible: root.apiToken.length > 0
-                height: Theme.iconSize * 0.85
-                width: Math.max(height, vertPillLabel.implicitWidth + 8)
-                radius: height / 2
+                visible: root.apiToken.length > 0 && root.pillStyle === "total"
+                height: Theme.iconSize * 0.85; width: Math.max(height, vTotalLbl.implicitWidth + 8); radius: height / 2
                 color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceContainerHigh
                 anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vTotalLbl; anchors.centerIn: parent; text: root.assignments.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: root.assignments.length > 0 ? "white" : Theme.surfaceVariantText }
+            }
 
-                StyledText {
-                    id: vertPillLabel
-                    anchors.centerIn: parent
-                    text: root.assignments.length.toString()
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Bold
-                    color: root.assignments.length > 0 ? "white" : Theme.surfaceVariantText
-                }
+            // tiers
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.assignments.length === 0
+                height: Theme.iconSize * 0.85; width: height; radius: height / 2; color: Theme.surfaceContainerHigh
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { anchors.centerIn: parent; text: "0"; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: Theme.surfaceVariantText }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.urgentCount > 0
+                height: Theme.iconSize * 0.85; width: Math.max(height, vTierUrgLbl.implicitWidth + 8); radius: height / 2; color: Theme.error
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vTierUrgLbl; anchors.centerIn: parent; text: root.urgentCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.soonCount > 0
+                height: Theme.iconSize * 0.85; width: Math.max(height, vTierSoonLbl.implicitWidth + 8); radius: height / 2; color: Theme.warning
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vTierSoonLbl; anchors.centerIn: parent; text: root.soonCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "tiers" && root.laterItems.length > 0
+                height: Theme.iconSize * 0.85; width: Math.max(height, vTierLateLbl.implicitWidth + 8); radius: height / 2; color: Theme.primary
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vTierLateLbl; anchors.centerIn: parent; text: root.laterItems.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+
+            // next
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "next" && root.assignments.length > 0
+                height: Theme.iconSize * 0.85; width: Math.max(height, vNextLbl.implicitWidth + 8); radius: height / 2; color: root.nextDueColor
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vNextLbl; anchors.centerIn: parent; text: root.nextDueLabel; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "next"
+                height: Theme.iconSize * 0.85; width: Math.max(height, vNextTotalLbl.implicitWidth + 8); radius: height / 2
+                color: root.assignments.length > 0 ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vNextTotalLbl; anchors.centerIn: parent; text: root.assignments.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: root.assignments.length > 0 ? Theme.surfaceText : Theme.surfaceVariantText }
+            }
+
+            // urgent
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "urgent" && root.urgentCount > 0
+                height: Theme.iconSize * 0.85; width: Math.max(height, vUrgLbl.implicitWidth + 8); radius: height / 2; color: Theme.error
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vUrgLbl; anchors.centerIn: parent; text: root.urgentCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: "white" }
+            }
+            Rectangle {
+                visible: root.apiToken.length > 0 && root.pillStyle === "urgent"
+                height: Theme.iconSize * 0.85; width: Math.max(height, vUrgTotalLbl.implicitWidth + 8); radius: height / 2
+                color: root.assignments.length > 0 ? root.badgeColor : Theme.surfaceContainerHigh
+                anchors.horizontalCenter: parent.horizontalCenter
+                StyledText { id: vUrgTotalLbl; anchors.centerIn: parent; text: root.assignments.length.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: root.assignments.length > 0 ? "white" : Theme.surfaceVariantText }
+            }
+
+            // Inbox (all styles)
+            Row {
+                visible: root.unreadInboxCount > 0
+                spacing: 2
+                anchors.horizontalCenter: parent.horizontalCenter
+                DankIcon { name: "mail"; size: Theme.iconSize * 0.7; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
+                StyledText { text: root.unreadInboxCount.toString(); font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Bold; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
             }
         }
     }
@@ -698,7 +968,11 @@ jq -cn \\
             onXChanged: if (visible) Qt.callLater(() => root.savePopoutPosition(x, y))
             onYChanged: if (visible) Qt.callLater(() => root.savePopoutPosition(x, y))
 
-            headerText: "Canvas LMS"
+            headerText: {
+                var parts = root.canvasDomain.split('.')
+                if (root.canvasDomain.endsWith('.instructure.com')) return parts[0].toUpperCase()
+                return parts.length >= 2 ? parts[parts.length - 2].toUpperCase() : root.canvasDomain.toUpperCase()
+            }
             detailsText: {
                 if (!root.apiToken) return "Configure API token in settings"
                 if (root.isError) return root.errorMessage
@@ -707,15 +981,317 @@ jq -cn \\
             }
             showCloseButton: false
 
-            Column {
+            Row {
                 width: parent.width
-                spacing: Theme.spacingS
+                height: root.popoutHeight
+                spacing: 0
+
+                // ── Left: Calendar panel ──────────────────────────────────
+                Item {
+                    width: 260
+                    height: parent.height
+                    clip: true
+
+                    Column {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingS
+                        anchors.bottomMargin: 20
+                        clip: true
+                        spacing: Theme.spacingXS
+
+                        // Month/Year navigation header
+                        Item {
+                            width: parent.width
+                            height: Theme.iconSize * 1.4
+
+                            Rectangle {
+                                id: calPrevBtn
+                                width: Theme.iconSize * 1.4
+                                height: Theme.iconSize * 1.4
+                                radius: height / 2
+                                color: calPrevMA.containsMouse ? Theme.surfaceContainerHighest : "transparent"
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+
+                                DankIcon {
+                                    anchors.centerIn: parent
+                                    name: "chevron_left"
+                                    size: Theme.iconSize * 0.8
+                                    color: Theme.surfaceText
+                                }
+                                MouseArea {
+                                    id: calPrevMA
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        if (root.calendarMonth === 0) { root.calendarMonth = 11; root.calendarYear-- }
+                                        else root.calendarMonth--
+                                    }
+                                }
+                            }
+
+                            StyledText {
+                                text: root.monthName(root.calendarMonth) + " " + root.calendarYear
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.Bold
+                                color: Theme.surfaceText
+                                anchors.centerIn: parent
+                            }
+
+                            Rectangle {
+                                id: calNextBtn
+                                width: Theme.iconSize * 1.4
+                                height: Theme.iconSize * 1.4
+                                radius: height / 2
+                                color: calNextMA.containsMouse ? Theme.surfaceContainerHighest : "transparent"
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.right: parent.right
+
+                                DankIcon {
+                                    anchors.centerIn: parent
+                                    name: "chevron_right"
+                                    size: Theme.iconSize * 0.8
+                                    color: Theme.surfaceText
+                                }
+                                MouseArea {
+                                    id: calNextMA
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        if (root.calendarMonth === 11) { root.calendarMonth = 0; root.calendarYear++ }
+                                        else root.calendarMonth++
+                                    }
+                                }
+                            }
+                        }
+
+                        // Day-of-week labels
+                        Row {
+                            spacing: 0
+                            Repeater {
+                                model: ["Su","Mo","Tu","We","Th","Fr","Sa"]
+                                StyledText {
+                                    width: 34
+                                    text: modelData
+                                    font.pixelSize: Theme.fontSizeSmall - 2
+                                    color: Theme.surfaceVariantText
+                                    horizontalAlignment: Text.AlignHCenter
+                                }
+                            }
+                        }
+
+                        // Day grid: 6 weeks × 7 days = 42 cells
+                        Grid {
+                            columns: 7
+                            spacing: 0
+
+                            Repeater {
+                                model: 42
+                                delegate: Item {
+                                    property int firstWeekday: new Date(root.calendarYear, root.calendarMonth, 1).getDay()
+                                    property int daysInMonth: new Date(root.calendarYear, root.calendarMonth + 1, 0).getDate()
+                                    property int dayOffset: index - firstWeekday
+                                    property bool inMonth: dayOffset >= 0 && dayOffset < daysInMonth
+                                    property int dayNum: dayOffset + 1
+                                    property bool isToday: {
+                                        if (!inMonth) return false
+                                        var t = new Date()
+                                        return root.calendarYear === t.getFullYear() && root.calendarMonth === t.getMonth() && dayNum === t.getDate()
+                                    }
+                                    property string dayKey: root.calendarYear + "-" + (root.calendarMonth + 1) + "-" + dayNum
+                                    property int assignCount: (inMonth && root.calendarDayMap[dayKey]) ? root.calendarDayMap[dayKey] : 0
+
+                                    width: 34
+                                    height: 40
+                                    opacity: inMonth ? 1.0 : 0.0
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        anchors.margins: 2
+                                        radius: 4
+                                        color: isToday ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.2) : "transparent"
+                                    }
+
+                                    StyledText {
+                                        anchors.top: parent.top
+                                        anchors.topMargin: 4
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: inMonth ? dayNum.toString() : ""
+                                        font.pixelSize: Theme.fontSizeSmall - 1
+                                        color: isToday ? Theme.primary : Theme.surfaceText
+                                        font.weight: isToday ? Font.Bold : Font.Normal
+                                    }
+
+                                    Rectangle {
+                                        visible: assignCount > 0
+                                        anchors.bottom: parent.bottom
+                                        anchors.bottomMargin: 3
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        width: Math.max(16, calBadgeLbl.implicitWidth + 4)
+                                        height: 14
+                                        radius: 7
+                                        color: Theme.primary
+
+                                        StyledText {
+                                            id: calBadgeLbl
+                                            anchors.centerIn: parent
+                                            text: assignCount.toString()
+                                            font.pixelSize: 9
+                                            font.weight: Font.Bold
+                                            color: "white"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // --- Unread Discussions ---
+                        Column {
+                            width: parent.width
+                            spacing: Theme.spacingXS
+                            visible: root.unreadDiscussions > 0
+
+                            Rectangle {
+                                width: parent.width
+                                height: 1
+                                color: Theme.outlineVariant
+                            }
+
+                            Row {
+                                spacing: Theme.spacingXS
+                                width: parent.width
+
+                                DankIcon {
+                                    name: "forum"
+                                    size: Theme.iconSize * 0.8
+                                    color: Theme.info
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StyledText {
+                                    text: root.unreadDiscussions + " unread discussion" + (root.unreadDiscussions !== 1 ? "s" : "")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.info
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+                        }
+
+                        // --- Announcements (below calendar) ---
+                        Column {
+                            width: parent.width
+                            spacing: Theme.spacingXS
+                            visible: root.announcements.length > 0
+
+                            Rectangle {
+                                width: parent.width
+                                height: 1
+                                color: Theme.outlineVariant
+                            }
+
+                            StyledText {
+                                text: "ANNOUNCEMENTS"
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                font.weight: Font.Bold
+                                color: Theme.surfaceVariantText
+                            }
+
+                            Repeater {
+                                model: root.announcements
+
+                                StyledRect {
+                                    required property var modelData
+                                    width: parent.width
+                                    height: leftAnnRow.implicitHeight + Theme.spacingS * 2
+                                    color: leftAnnArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
+                                    radius: Theme.cornerRadius
+
+                                    Behavior on color { ColorAnimation { duration: 100 } }
+
+                                    Row {
+                                        id: leftAnnRow
+                                        anchors {
+                                            left: parent.left; right: parent.right
+                                            verticalCenter: parent.verticalCenter
+                                            leftMargin: Theme.spacingS
+                                            rightMargin: Theme.spacingS
+                                        }
+                                        spacing: Theme.spacingS
+
+                                        DankIcon {
+                                            name: "notifications"
+                                            size: Theme.iconSize * 0.8
+                                            color: Theme.primary
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+
+                                        Column {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            width: parent.width - Theme.iconSize * 0.8 - Theme.spacingS * 2
+                                            spacing: 2
+
+                                            StyledText {
+                                                text: modelData.title
+                                                font.pixelSize: Theme.fontSizeSmall
+                                                color: Theme.surfaceText
+                                                elide: Text.ElideRight
+                                                width: parent.width
+                                            }
+
+                                            StyledText {
+                                                text: modelData.course
+                                                font.pixelSize: Theme.fontSizeSmall - 1
+                                                color: Theme.surfaceVariantText
+                                                elide: Text.ElideRight
+                                                width: parent.width
+                                            }
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: leftAnnArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.openUrl(modelData.url)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Divider ───────────────────────────────────────────────
+                Rectangle {
+                    width: 1
+                    height: parent.height
+                    color: Theme.outlineVariant
+                }
+
+                // ── Right: existing content ───────────────────────────────
+                Item {
+                    width: root.popoutWidth - 261
+                    height: parent.height
+                    clip: true
+
+                    Column {
+                        id: rightTopCol
+                        anchors.top: parent.top
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.topMargin: Theme.spacingS
+                        anchors.leftMargin: Theme.spacingS
+                        anchors.rightMargin: Theme.spacingS
+                        spacing: Theme.spacingS
 
                 // ── Refresh button ────────────────────────────────────────
-                Row {
-                    anchors.right: parent.right
-
+                Item {
+                    width: parent.width
+                    height: Theme.iconSize * 1.5
                     Rectangle {
+                        anchors.right: parent.right
                         width: Theme.iconSize * 1.5
                         height: Theme.iconSize * 1.5
                         radius: Theme.iconSize * 0.75
@@ -924,7 +1500,7 @@ jq -cn \\
                         width: parent.width
                         columns: 2
                         columnSpacing: Theme.spacingS
-                        rowSpacing: Theme.spacingXS
+                        rowSpacing: Theme.spacingS
 
                         Repeater {
                             model: root.courses
@@ -932,43 +1508,69 @@ jq -cn \\
                             StyledRect {
                                 required property var modelData
                                 width: (parent.width - Theme.spacingS) / 2
-                                height: gradeRowInner.implicitHeight + Theme.spacingXS * 2
+                                height: gradeChipCol.implicitHeight + Theme.spacingS * 2
                                 color: gradeChipArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
                                 radius: Theme.cornerRadius
 
                                 Behavior on color { ColorAnimation { duration: 100 } }
 
-                                Row {
-                                    id: gradeRowInner
+                                Column {
+                                    id: gradeChipCol
                                     anchors {
                                         left: parent.left; right: parent.right
                                         verticalCenter: parent.verticalCenter
                                         leftMargin: Theme.spacingS
-                                        rightMargin: Theme.spacingXS
+                                        rightMargin: Theme.spacingS
                                     }
                                     spacing: Theme.spacingXS
 
-                                    StyledText {
-                                        text: modelData.code || modelData.name
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceText
-                                        elide: Text.ElideRight
-                                        width: parent.width - gradeVal.implicitWidth - Theme.spacingXS
-                                        anchors.verticalCenter: parent.verticalCenter
+                                    Row {
+                                        width: parent.width
+                                        spacing: Theme.spacingXS
+
+                                        StyledText {
+                                            text: modelData.code || modelData.name
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.surfaceText
+                                            elide: Text.ElideRight
+                                            width: parent.width - gradeVal.implicitWidth - Theme.spacingXS
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+
+                                        StyledText {
+                                            id: gradeVal
+                                            text: {
+                                                var g = modelData.grade || "--"
+                                                var s = modelData.score
+                                                if (s !== null && s !== undefined) return g + " " + Math.round(s) + "%"
+                                                return g
+                                            }
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            font.weight: Font.Bold
+                                            color: Theme.primary
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
                                     }
 
                                     StyledText {
-                                        id: gradeVal
+                                        width: parent.width
+                                        visible: text.length > 0
                                         text: {
-                                            var g = modelData.grade || "--"
-                                            var s = modelData.score
-                                            if (s !== null && s !== undefined) return g + " " + Math.round(s) + "%"
-                                            return g
+                                            var groups = root.assignmentGroups
+                                            var g = groups ? groups[String(modelData.id)] : null
+                                            if (!g || g.length === 0) return ""
+                                            var parts = []
+                                            for (var i = 0; i < Math.min(g.length, 4); i++) {
+                                                var grp = g[i]
+                                                var s = (grp.score !== null && grp.score !== undefined) ? Math.round(grp.score) + "%" : "--"
+                                                parts.push(grp.name.substring(0, 6) + ": " + s)
+                                            }
+                                            return parts.join(" · ")
                                         }
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        font.weight: Font.Bold
-                                        color: Theme.primary
-                                        anchors.verticalCenter: parent.verticalCenter
+                                        font.pixelSize: Theme.fontSizeSmall - 2
+                                        color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                        wrapMode: Text.NoWrap
                                     }
                                 }
 
@@ -991,11 +1593,18 @@ jq -cn \\
                     color: Theme.outlineVariant
                 }
 
+                    } // rightTopCol
+
                 // ── Scrollable assignments + missing + announcements ───────
                 Flickable {
                     visible: root.apiToken && !root.isError
-                    width: parent.width
-                    height: Math.min(contentHeight, root.popoutHeight - 280)
+                    anchors.top: rightTopCol.bottom
+                    anchors.topMargin: Theme.spacingS
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.spacingS
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.spacingS
+                    anchors.bottom: parent.bottom
                     contentHeight: mainCol.implicitHeight
                     clip: true
 
@@ -1172,102 +1781,12 @@ jq -cn \\
                             }
                         }
 
-                        // --- ANNOUNCEMENTS ---
-                        Column {
-                            width: parent.width
-                            spacing: Theme.spacingXS
-                            visible: root.announcements.length > 0
-
-                            Rectangle {
-                                visible: root.assignments.length > 0 || root.missingWork.length > 0
-                                width: parent.width
-                                height: 1
-                                color: Theme.outlineVariant
-                            }
-
-                            StyledText {
-                                text: "ANNOUNCEMENTS"
-                                font.pixelSize: Theme.fontSizeSmall - 1
-                                font.weight: Font.Bold
-                                color: Theme.surfaceVariantText
-                            }
-
-                            Repeater {
-                                model: root.announcements
-
-                                StyledRect {
-                                    required property var modelData
-                                    width: parent.width
-                                    height: annRow.implicitHeight + Theme.spacingS * 2
-                                    color: annArea.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainerHigh
-                                    radius: Theme.cornerRadius
-
-                                    Behavior on color { ColorAnimation { duration: 100 } }
-
-                                    Row {
-                                        id: annRow
-                                        anchors {
-                                            left: parent.left; right: parent.right
-                                            verticalCenter: parent.verticalCenter
-                                            leftMargin: Theme.spacingS
-                                            rightMargin: Theme.spacingS
-                                        }
-                                        spacing: Theme.spacingS
-
-                                        DankIcon {
-                                            name: "notifications"
-                                            size: Theme.iconSize * 0.8
-                                            color: Theme.primary
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-
-                                        Column {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            width: parent.width - Theme.iconSize * 0.8 - annTime.implicitWidth - Theme.spacingS * 3
-                                            spacing: 2
-
-                                            StyledText {
-                                                text: modelData.title
-                                                font.pixelSize: Theme.fontSizeSmall
-                                                color: Theme.surfaceText
-                                                elide: Text.ElideRight
-                                                width: parent.width
-                                            }
-
-                                            StyledText {
-                                                text: modelData.course
-                                                font.pixelSize: Theme.fontSizeSmall - 1
-                                                color: Theme.surfaceVariantText
-                                                elide: Text.ElideRight
-                                                width: parent.width
-                                            }
-                                        }
-
-                                        StyledText {
-                                            id: annTime
-                                            text: root.formatPosted(modelData.hours_ago)
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: Theme.surfaceVariantText
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-                                    }
-
-                                    MouseArea {
-                                        id: annArea
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: root.openUrl(modelData.url)
-                                    }
-                                }
-                            }
-                        }
-
                         // Bottom padding
                         Item { width: 1; height: Theme.spacingS }
                     }
                 }
-            }
+                } // right Item
+            } // Row
         }
     }
 }
