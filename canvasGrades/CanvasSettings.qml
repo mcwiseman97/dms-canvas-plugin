@@ -19,7 +19,7 @@ PluginSettings {
     PluginGlobalVar {
         id: canvasDomainSetting
         varName: "canvasDomain"
-        defaultValue: "byupw.instructure.com"
+        defaultValue: "yourschooldomain.instructure.com"
     }
 
     PluginGlobalVar {
