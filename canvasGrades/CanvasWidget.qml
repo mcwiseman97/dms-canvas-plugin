@@ -1272,7 +1272,7 @@ jq -cn \\
 
                 // ── Right: existing content ───────────────────────────────
                 Item {
-                    width: root.popoutWidth - 261
+                    width: root.popoutWidth - 269
                     height: parent.height
                     clip: true
 
@@ -1283,7 +1283,7 @@ jq -cn \\
                         anchors.right: parent.right
                         anchors.topMargin: Theme.spacingS
                         anchors.leftMargin: Theme.spacingS
-                        anchors.rightMargin: Theme.spacingS
+                        anchors.rightMargin: Theme.spacingL
                         spacing: Theme.spacingS
 
                 // ── Refresh button ────────────────────────────────────────
@@ -1352,7 +1352,7 @@ jq -cn \\
                             font.pixelSize: Theme.fontSizeSmall
                             anchors.horizontalCenter: parent.horizontalCenter
                             wrapMode: Text.WordWrap
-                            width: 260
+                            width: parent.width - Theme.spacingL
                             horizontalAlignment: Text.AlignHCenter
                         }
                     }
@@ -1603,7 +1603,7 @@ jq -cn \\
                     anchors.left: parent.left
                     anchors.leftMargin: Theme.spacingS
                     anchors.right: parent.right
-                    anchors.rightMargin: Theme.spacingS
+                    anchors.rightMargin: Theme.spacingL
                     anchors.bottom: parent.bottom
                     contentHeight: mainCol.implicitHeight
                     clip: true
